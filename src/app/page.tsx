@@ -1,103 +1,193 @@
-import Image from "next/image";
+'use client';
+
+import { useState, useEffect, useCallback } from 'react';
+import { trpc } from '../lib/trpc';
+import { useUser } from '@auth0/nextjs-auth0/client';
+import Link from 'next/link';
+import { supabase } from '../../server/db/supabase';
+import type { Message } from '../../server/db/supabase';
 
 export default function Home() {
-  return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+  const [message, setMessage] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [localMessages, setLocalMessages] = useState<Message[]>([]);
+  const { user, isLoading: authLoading } = useUser();
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+  const userId = user?.sub ?? '';
+
+  const { data: messages = [], refetch } = trpc.getMessages.useQuery(
+    { user_id: userId, limit: 50 },
+    { 
+      enabled: !!userId,
+      staleTime: 30000, // Cache for 30 seconds
+      refetchOnWindowFocus: false,
+    }
+  );
+
+  const chatWithGeminiMutation = trpc.chatWithGemini.useMutation({
+    onMutate: async (variables) => {
+      // Optimistic update - add user message immediately
+      const optimisticMessage: Message = {
+        id: `temp-${Date.now()}`,
+        user_id: userId,
+        role: 'user',
+        content: variables.message,
+        created_at: new Date().toISOString(),
+      };
+      
+      setLocalMessages(prev => [...prev, optimisticMessage]);
+      setMessage('');
+    },
+    onError: (error, variables) => {
+      // Remove optimistic message on error
+      setLocalMessages(prev => prev.filter(msg => msg.id !== `temp-${Date.now()}`));
+      console.error('Failed to send message:', error);
+    },
+  });
+
+  // Initialize local messages when tRPC data loads
+  useEffect(() => {
+    if (messages.length > 0) {
+      setLocalMessages(messages);
+    }
+  }, [messages]);
+
+  // Set up Supabase Realtime subscription
+  useEffect(() => {
+    if (!userId) return;
+
+    const channel = supabase
+      .channel('public:messages')
+      .on(
+        'postgres_changes',
+        { 
+          event: 'INSERT', 
+          schema: 'public', 
+          table: 'messages',
+          filter: `user_id=eq.${userId}`
+        },
+        (payload) => {
+          console.log('New message received:', payload.new);
+          setLocalMessages(prev => [...prev, payload.new as Message]);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [userId]);
+
+  const handleSendMessage = useCallback(async () => {
+    if (!userId) return; // guard
+    if (message.trim() && !isLoading) {
+      setIsLoading(true);
+      const content = message.trim();
+      
+      // Check if this is an image request
+      const isImageRequest = content.startsWith('/image');
+      const sanitizedMessage = isImageRequest ? content.substring('/image'.length).trim() : content;
+
+      try {
+        await chatWithGeminiMutation.mutateAsync({
+          message: sanitizedMessage,
+          userId: userId,
+          isImageRequest,
+        });
+      } catch (error) {
+        console.error('Failed to send message:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+  }, [message, userId, isLoading, chatWithGeminiMutation]);
+
+  const handleKeyPress = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSendMessage();
+    }
+  }, [handleSendMessage]);
+
+  const formatTime = useCallback((timestamp: string) =>
+    new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), []);
+
+  return (
+    <div className="chat-container">
+      {/* Chat Messages Area */}
+      <div className="bg-light" style={{ height: 'calc(100vh - 200px)', overflowY: 'auto' }}>
+        <div className="p-3">
+          {!user && !authLoading && (
+            <div className="alert alert-info">Please <Link href="/api/auth/login">log in</Link> to view and send messages.</div>
+          )}
+
+          {user && localMessages.length === 0 && (
+            <div className="d-flex mb-3">
+              <div className="bg-white rounded p-3 shadow-sm" style={{ maxWidth: '80%' }}>
+                <p className="mb-0">Welcome {user.name ?? 'there'}! I'm powered by Google Gemini AI. Ask me anything or use /image for image-related requests.</p>
+                <small className="text-muted">Just now</small>
+              </div>
+            </div>
+          )}
+
+          {user && localMessages.map((msg) => (
+            <div key={msg.id} className={`d-flex mb-3 ${msg.role === 'user' ? 'justify-content-end' : ''}`}>
+              <div className={`rounded p-3 shadow-sm ${msg.role === 'user' ? 'bg-primary text-white' : 'bg-white'}`} style={{ maxWidth: '80%' }}>
+                <p className="mb-0">{msg.content}</p>
+                <small className={msg.role === 'user' ? 'text-white-50' : 'text-muted'}>
+                  {formatTime(msg.created_at)}
+                </small>
+              </div>
+            </div>
+          ))}
+
+          {isLoading && user && (
+            <div className="d-flex mb-3">
+              <div className="bg-white rounded p-3 shadow-sm" style={{ maxWidth: '80%' }}>
+                <div className="d-flex align-items-center">
+                  <div className="spinner-border spinner-border-sm me-2" role="status">
+                    <span className="visually-hidden">Loading...</span>
+                  </div>
+                  <span className="text-muted">Gemini AI is thinking...</span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+      </div>
+
+      {/* Input Section */}
+      <div className="bg-white border-top p-3">
+        <div className="d-flex align-items-end">
+          <div className="flex-grow-1 me-2">
+            <textarea
+              className="form-control"
+              placeholder={user ? 'Type your message... (use /image for image requests)' : 'Login to chat'}
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              onKeyPress={handleKeyPress}
+              rows={1}
+              style={{ resize: 'none' }}
+              disabled={isLoading || !user}
+            />
+          </div>
+          {user ? (
+            <button className="btn btn-primary" onClick={handleSendMessage} disabled={!message.trim() || isLoading}>
+              {isLoading ? (
+                <div className="spinner-border spinner-border-sm" role="status">
+                  <span className="visually-hidden">Loading...</span>
+                </div>
+              ) : (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
+                </svg>
+              )}
+            </button>
+          ) : (
+            <Link href="/api/auth/login" className="btn btn-primary">Login</Link>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
